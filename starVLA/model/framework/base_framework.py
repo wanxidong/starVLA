@@ -288,6 +288,9 @@ class baseframework(PreTrainedModel):
         config = dict_to_namespace(model_config)
         model_config = config
         model_config.trainer.pretrained_checkpoint = None
+        # the checkpoint holds every weight: the model its run started from is not needed to rebuild it
+        if OmegaConf.select(model_config, "framework.qwenvl.finetune_from") is not None:
+            model_config.framework.qwenvl.finetune_from = None
 
         FrameworkModel = build_framework(cfg=model_config)
         # set for action un-norm

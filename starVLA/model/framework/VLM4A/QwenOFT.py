@@ -20,6 +20,7 @@ Note: How to add special tokens to Qwen2.5:
 
 """
 
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
@@ -81,6 +82,21 @@ class QwenOFTDefaultConfig:
             "base_vlm": "./playground/Pretrained_models/Qwen3-VL-4B-Instruct-Action",
             # Attention implementation: "flash_attention_2" | "eager" | "sdpa"
             "attn_implementation": "flash_attention_2",
+            # A StarVLA checkpoint (<run>/checkpoints/*.pt | *.safetensors) whose VLM replaces the one of
+            # base_vlm as the starting point, before LoRA is added. Its action head is not taken, so it may
+            # have another action dimension or chunk length. None: start from base_vlm.
+            "finetune_from": None,
+            # LoRA on the VLM (peft). enabled=False: every VLM weight is trained (the behaviour without this
+            # block). enabled=True: the VLM is frozen and adapters on its linear layers are trained instead;
+            # the action head is trained in full either way.
+            "lora": {
+                "enabled": False,
+                "rank": 32,
+                "alpha": 16,
+                "dropout": 0.0,
+                # False: adapters on the language model only, the vision tower stays as pretrained
+                "vision": True,
+            },
         }
     )
 
@@ -99,6 +115,56 @@ class QwenOFTDefaultConfig:
             "past_action_window_size": 0,
         }
     )
+
+
+def load_vlm_from_checkpoint(vlm_interface: torch.nn.Module, checkpoint_path: str) -> None:
+    """Replace the VLM weights by the ``qwen_vl_interface.*`` tensors of a StarVLA checkpoint (strict).
+
+    The source has to hold the whole VLM under its plain parameter names, i.e. come from a run that
+    trained the VLM without LoRA.
+    """
+    if not os.path.isfile(checkpoint_path):
+        raise FileNotFoundError(f"framework.qwenvl.finetune_from: `{checkpoint_path}` does not exist")
+    if str(checkpoint_path).endswith(".safetensors"):
+        from safetensors.torch import load_file
+
+        state_dict = load_file(str(checkpoint_path))
+    else:
+        state_dict = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    prefix = "qwen_vl_interface."
+    vlm_state_dict = {k[len(prefix) :]: v for k, v in state_dict.items() if k.startswith(prefix)}
+    if not vlm_state_dict:
+        raise KeyError(f"framework.qwenvl.finetune_from: no `{prefix}*` tensors in `{checkpoint_path}`")
+    vlm_interface.load_state_dict(vlm_state_dict, strict=True)
+
+
+def add_lora_to_vlm(vlm: torch.nn.Module, lora_cfg) -> None:
+    """Freeze the VLM and put a trainable LoRA adapter on its linear layers, in place.
+
+    openvla-oft's recipe: every ``nn.Linear`` except the LM head (attention and MLP projections of the
+    language model, and with ``vision`` the vision blocks and merger), ``A`` Gaussian, ``B`` zero, so the
+    model starts as the pretrained one. Module paths are kept: an adapted layer becomes
+    ``<layer>.base_layer`` + ``<layer>.lora_A / lora_B``, and a checkpoint of the whole model loads into
+    a model built from the same config.
+    """
+    from peft import LoraConfig, inject_adapter_in_model
+    from peft.tuners.lora import LoraLayer
+
+    vlm.requires_grad_(False)
+    lora = LoraConfig(
+        r=int(lora_cfg.get("rank", 32)),
+        lora_alpha=int(lora_cfg.get("alpha", 16)),
+        lora_dropout=float(lora_cfg.get("dropout", 0.0)),
+        target_modules="all-linear",
+        exclude_modules=None if lora_cfg.get("vision", True) else r"(.*\.)?visual\..*",
+        init_lora_weights="gaussian",
+    )
+    inject_adapter_in_model(lora, vlm)
+    for module in vlm.modules():
+        if isinstance(module, LoraLayer):
+            # peft would convert the layer input to the adapter's dtype first; the model runs under
+            # autocast, where the adapter can take the input as it is.
+            module.cast_input_dtype_enabled = False
 
 
 @FRAMEWORK_REGISTRY.register("QwenOFT")
@@ -130,6 +196,12 @@ class Qwenvl_OFT(baseframework):
         # Merge framework defaults with YAML config (YAML wins on conflicts)
         self.config = merge_framework_config(QwenOFTDefaultConfig, config)
         self.qwen_vl_interface = get_vlm_model(config=self.config)
+        finetune_from = self.config.framework.qwenvl.get("finetune_from", None)
+        if finetune_from:
+            load_vlm_from_checkpoint(self.qwen_vl_interface, finetune_from)
+        lora_cfg = self.config.framework.qwenvl.get("lora", None)
+        if lora_cfg is not None and lora_cfg.get("enabled", False):
+            add_lora_to_vlm(self.qwen_vl_interface.model, lora_cfg)
         # align action_hidden_dim to VLM hidden_size at runtime
         self.config.framework.action_model.action_hidden_dim = self.qwen_vl_interface.model.config.hidden_size
         self.action_model = get_action_model(config=self.config)
